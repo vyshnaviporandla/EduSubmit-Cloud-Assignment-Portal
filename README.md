@@ -179,7 +179,7 @@ assignments
       ├── maxMarks
       ├── createdBy
       └── createdAt
-  ```
+```
 submissions
 
 Stores student submission information.
