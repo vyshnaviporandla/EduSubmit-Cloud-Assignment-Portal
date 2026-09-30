@@ -52,14 +52,18 @@ export default function App() {
         const profileRef = doc(db, "profiles", currentUser.uid);
         const profileSnap = await getDoc(profileRef);
 
+        let currentProfile = null;
+
         if (profileSnap.exists()) {
-          setProfile({
+          currentProfile = {
             id: currentUser.uid,
             ...profileSnap.data(),
-          });
+          };
+
+          setProfile(currentProfile);
         }
 
-        await loadData(currentUser.uid);
+        await loadData(currentUser.uid, currentProfile);
       } catch (error) {
         console.error("Loading error:", error);
       }
@@ -70,7 +74,7 @@ export default function App() {
     return () => unsubscribe();
   }, []);
 
-  async function loadData(uid) {
+  async function loadData(uid, currentProfile = profile) {
     try {
       const courseSnapshot = await getDocs(collection(db, "courses"));
 
@@ -81,17 +85,41 @@ export default function App() {
         }))
       );
 
-      const assignmentQuery = query(
-        collection(db, "assignments"),
-        orderBy("dueDate", "asc")
-      );
+      let assignmentData = [];
 
-      const assignmentSnapshot = await getDocs(assignmentQuery);
+      try {
+        const assignmentQuery = query(
+          collection(db, "assignments"),
+          orderBy("dueDate", "asc")
+        );
 
-      const assignmentData = assignmentSnapshot.docs.map((item) => ({
-        id: item.id,
-        ...item.data(),
-      }));
+        const assignmentSnapshot = await getDocs(assignmentQuery);
+
+        assignmentData = assignmentSnapshot.docs.map((item) => ({
+          id: item.id,
+          ...item.data(),
+        }));
+      } catch (assignmentError) {
+        console.warn(
+          "Ordered assignment query failed. Loading without orderBy.",
+          assignmentError
+        );
+
+        const assignmentSnapshot = await getDocs(
+          collection(db, "assignments")
+        );
+
+        assignmentData = assignmentSnapshot.docs.map((item) => ({
+          id: item.id,
+          ...item.data(),
+        }));
+
+        assignmentData.sort((a, b) => {
+          const first = convertTimestamp(a.dueDate)?.getTime() || 0;
+          const second = convertTimestamp(b.dueDate)?.getTime() || 0;
+          return first - second;
+        });
+      }
 
       setAssignments(assignmentData);
 
@@ -105,35 +133,21 @@ export default function App() {
       }));
 
       const userSubmissions =
-        profile?.role === "teacher"
+        currentProfile?.role === "teacher"
           ? allSubmissions
-          : allSubmissions.filter((item) => item.studentId === uid);
+          : allSubmissions.filter(
+              (item) => item.studentId === uid
+            );
 
       setSubmissions(userSubmissions);
     } catch (error) {
       console.error("Data loading error:", error);
-
-      // Fallback without orderBy if an index is required.
-      try {
-        const assignmentSnapshot = await getDocs(
-          collection(db, "assignments")
-        );
-
-        setAssignments(
-          assignmentSnapshot.docs.map((item) => ({
-            id: item.id,
-            ...item.data(),
-          }))
-        );
-      } catch (fallbackError) {
-        console.error(fallbackError);
-      }
     }
   }
 
   async function refreshData() {
     if (user) {
-      await loadData(user.uid);
+      await loadData(user.uid, profile);
     }
   }
 
@@ -298,6 +312,7 @@ function AuthScreen() {
 
                 <div className="input-wrapper">
                   <span>👤</span>
+
                   <input
                     type="text"
                     placeholder="Enter your full name"
@@ -313,6 +328,7 @@ function AuthScreen() {
 
               <div className="input-wrapper">
                 <span>✉</span>
+
                 <input
                   type="email"
                   placeholder="you@example.com"
@@ -328,6 +344,7 @@ function AuthScreen() {
 
               <div className="input-wrapper">
                 <span>🔒</span>
+
                 <input
                   type="password"
                   placeholder="Enter your password"
@@ -531,9 +548,13 @@ function StudentDashboard({
     submissions.map((submission) => submission.assignmentId)
   );
 
-  const pendingAssignments = assignments.filter(
-    (assignment) => !submittedIds.has(assignment.id)
-  );
+  const pendingAssignments = assignments.filter((assignment) => {
+    const submission = submissions.find(
+      (item) => item.assignmentId === assignment.id
+    );
+
+    return !submission;
+  });
 
   const gradedSubmissions = submissions.filter(
     (submission) =>
@@ -620,7 +641,9 @@ function StudentDashboard({
             assignments.map((assignment) => (
               <StudentAssignment
                 key={assignment.id}
+                profile={profile}
                 assignment={assignment}
+                submissions={submissions}
                 submitted={submittedIds.has(assignment.id)}
                 refreshData={refreshData}
               />
@@ -755,13 +778,26 @@ function StudentDashboard({
 ========================================================= */
 
 function StudentAssignment({
+  profile,
   assignment,
+  submissions,
   submitted,
   refreshData,
 }) {
   const [file, setFile] = useState(null);
   const [uploading, setUploading] = useState(false);
   const [message, setMessage] = useState("");
+
+  const existingSubmission = submissions.find(
+    (submission) => submission.assignmentId === assignment.id
+  );
+
+  const deadlineStatus = getAssignmentStatus(
+    assignment,
+    existingSubmission
+  );
+
+  const deadlinePassed = isDeadlinePassed(assignment.dueDate);
 
   async function handleSubmit() {
     if (!file) {
@@ -784,30 +820,49 @@ function StudentAssignment({
       return;
     }
 
-    if (!auth.currentUser) return;
+    if (!auth.currentUser) {
+      setMessage("Please sign in again.");
+      return;
+    }
 
     setUploading(true);
     setMessage("");
 
     try {
+      const dueDate = convertTimestamp(assignment.dueDate);
+      const submittedAt = new Date();
+
+      const wasLate = dueDate
+        ? submittedAt.getTime() > dueDate.getTime()
+        : false;
+
       await addDoc(collection(db, "submissions"), {
         assignmentId: assignment.id,
         assignmentTitle: assignment.title || "Assignment",
         studentId: auth.currentUser.uid,
-        studentName: auth.currentUser.displayName || "",
-        studentEmail: auth.currentUser.email,
+        studentName: profile?.name || "",
+        studentEmail: auth.currentUser.email || "",
         fileName: file.name,
         fileType: file.type,
         fileSize: file.size,
         fileUrl: "",
-        status: "Submitted",
+        status: wasLate ? "Late" : "Submitted",
+        submissionStatus: wasLate ? "Late" : "On Time",
         marks: null,
         feedback: "",
         submittedAt: serverTimestamp(),
+        submittedAtClient: submittedAt.toISOString(),
+        dueDate: assignment.dueDate || null,
       });
 
       setFile(null);
-      setMessage("Assignment submitted successfully.");
+
+      setMessage(
+        wasLate
+          ? "Assignment submitted. It was submitted after the deadline."
+          : "Assignment submitted successfully and on time."
+      );
+
       await refreshData();
     } catch (error) {
       console.error(error);
@@ -826,15 +881,10 @@ function StudentAssignment({
           <div className="assignment-title-row">
             <h3>{assignment.title || "Untitled assignment"}</h3>
 
-            {submitted ? (
-              <span className="status-pill submitted">
-                ✓ Submitted
-              </span>
-            ) : (
-              <span className="status-pill pending">
-                Pending
-              </span>
-            )}
+            <AssignmentStatusBadge
+              status={deadlineStatus}
+              submitted={submitted}
+            />
           </div>
 
           <p className="assignment-description">
@@ -843,15 +893,16 @@ function StudentAssignment({
 
           <div className="assignment-meta">
             <span>
-              📅{" "}
-              {formatDate(
-                assignment.dueDate
-              )}
+              📅 {formatDate(assignment.dueDate)}
             </span>
 
             <span>
               🎯 {assignment.maxMarks || 100} marks
             </span>
+          </div>
+
+          <div className="deadline-label">
+            {getDeadlineMessage(assignment, existingSubmission)}
           </div>
         </div>
       </div>
@@ -860,6 +911,7 @@ function StudentAssignment({
         <div className="submission-area">
           <label className="file-picker">
             <span>📎</span>
+
             <span>
               {file ? file.name : "Choose PDF or DOCX"}
             </span>
@@ -887,10 +939,37 @@ function StudentAssignment({
         </div>
       )}
 
-      {submitted && (
+      {submitted && existingSubmission && (
+        <div
+          className={`submitted-notice ${
+            existingSubmission.submissionStatus === "Late"
+              ? "late-notice"
+              : ""
+          }`}
+        >
+          <span>
+            {existingSubmission.submissionStatus === "Late"
+              ? "⏰"
+              : "✓"}
+          </span>
+
+          {existingSubmission.submissionStatus === "Late"
+            ? "Your submission was recorded after the deadline."
+            : "Your submission was recorded on time."}
+        </div>
+      )}
+
+      {submitted && !existingSubmission && (
         <div className="submitted-notice">
           <span>✓</span>
           Your submission has been recorded.
+        </div>
+      )}
+
+      {deadlinePassed && !submitted && (
+        <div className="submitted-notice late-notice">
+          <span>⏰</span>
+          The deadline has passed. Late submissions are still accepted.
         </div>
       )}
     </div>
@@ -1005,6 +1084,12 @@ function TeacherDashboard({
                   <p>
                     Due {formatDate(assignment.dueDate)}
                   </p>
+
+                  <span className="deadline-small">
+                    {isDeadlinePassed(assignment.dueDate)
+                      ? "Deadline passed"
+                      : getTimeRemaining(assignment.dueDate)}
+                  </span>
                 </div>
               </div>
             ))
@@ -1059,6 +1144,13 @@ function CreateAssignment({ onCreated }) {
       return;
     }
 
+    const selectedDate = new Date(dueDate);
+
+    if (Number.isNaN(selectedDate.getTime())) {
+      setMessage("Please select a valid due date.");
+      return;
+    }
+
     setLoading(true);
     setMessage("");
 
@@ -1066,7 +1158,7 @@ function CreateAssignment({ onCreated }) {
       await addDoc(collection(db, "assignments"), {
         title: title.trim(),
         description: description.trim(),
-        dueDate: new Date(dueDate),
+        dueDate: selectedDate,
         maxMarks: Number(maxMarks) || 100,
         createdBy: auth.currentUser?.uid,
         createdAt: serverTimestamp(),
@@ -1148,6 +1240,7 @@ function CreateAssignment({ onCreated }) {
           disabled={loading}
         >
           {loading ? "Creating..." : "Create assignment"}
+
           {!loading && <span>→</span>}
         </button>
 
@@ -1179,6 +1272,15 @@ function TeacherSubmission({
   const [message, setMessage] = useState("");
 
   async function saveGrade() {
+    if (marks !== "") {
+      const numericMarks = Number(marks);
+
+      if (Number.isNaN(numericMarks) || numericMarks < 0) {
+        setMessage("Please enter valid marks.");
+        return;
+      }
+    }
+
     setSaving(true);
     setMessage("");
 
@@ -1186,9 +1288,11 @@ function TeacherSubmission({
       await updateDoc(doc(db, "submissions", submission.id), {
         marks: marks === "" ? null : Number(marks),
         feedback,
-        status: marks === "" ? "Submitted" : "Graded",
-        gradedAt: serverTimestamp(),
-        gradedBy: auth.currentUser?.uid,
+        status: marks === "" ? submission.status || "Submitted" : "Graded",
+        gradedAt:
+          marks === "" ? null : serverTimestamp(),
+        gradedBy:
+          marks === "" ? null : auth.currentUser?.uid,
       });
 
       setMessage("Saved.");
@@ -1200,6 +1304,15 @@ function TeacherSubmission({
 
     setSaving(false);
   }
+
+  const isGraded =
+    submission.marks !== null &&
+    submission.marks !== undefined &&
+    submission.marks !== "";
+
+  const isLate =
+    submission.submissionStatus === "Late" ||
+    submission.status === "Late";
 
   return (
     <div className="grading-card">
@@ -1224,31 +1337,42 @@ function TeacherSubmission({
           </div>
         </div>
 
-        <span
-          className={`status-pill ${
-            submission.marks !== null &&
-            submission.marks !== undefined &&
-            submission.marks !== ""
-              ? "graded"
-              : "pending"
-          }`}
-        >
-          {submission.marks !== null &&
-          submission.marks !== undefined &&
-          submission.marks !== ""
-            ? "Graded"
-            : "Needs review"}
-        </span>
+        <div className="grading-statuses">
+          {isLate && (
+            <span className="status-pill late">
+              ⏰ Late
+            </span>
+          )}
+
+          <span
+            className={`status-pill ${
+              isGraded ? "graded" : "pending"
+            }`}
+          >
+            {isGraded ? "Graded" : "Needs review"}
+          </span>
+        </div>
       </div>
 
       <div className="submission-file">
         <span>📄</span>
 
         <div>
-          <strong>{submission.fileName || "Submitted file"}</strong>
+          <strong>
+            {submission.fileName || "Submitted file"}
+          </strong>
+
           <small>
             Submitted {formatDate(submission.submittedAt)}
           </small>
+
+          {submission.submissionStatus && (
+            <small className={isLate ? "late-text" : "ontime-text"}>
+              {isLate
+                ? "Submitted after deadline"
+                : "Submitted on time"}
+            </small>
+          )}
         </div>
       </div>
 
@@ -1293,6 +1417,50 @@ function TeacherSubmission({
 }
 
 /* =========================================================
+   STATUS BADGE
+========================================================= */
+
+function AssignmentStatusBadge({ status, submitted }) {
+  if (!submitted) {
+    if (status === "Overdue") {
+      return (
+        <span className="status-pill late">
+          ⏰ Overdue
+        </span>
+      );
+    }
+
+    return (
+      <span className="status-pill pending">
+        Pending
+      </span>
+    );
+  }
+
+  if (status === "Late") {
+    return (
+      <span className="status-pill late">
+        ⏰ Late
+      </span>
+    );
+  }
+
+  if (status === "Graded") {
+    return (
+      <span className="status-pill graded">
+        ✓ Graded
+      </span>
+    );
+  }
+
+  return (
+    <span className="status-pill submitted">
+      ✓ Submitted
+    </span>
+  );
+}
+
+/* =========================================================
    COMPONENTS
 ========================================================= */
 
@@ -1326,7 +1494,9 @@ function EmptyState({ icon, title, text }) {
   return (
     <div className="empty-state">
       <div className="empty-icon">{icon}</div>
+
       <strong>{title}</strong>
+
       <p>{text}</p>
     </div>
   );
@@ -1337,6 +1507,10 @@ function SubmissionCard({ submission }) {
     submission.marks !== null &&
     submission.marks !== undefined &&
     submission.marks !== "";
+
+  const isLate =
+    submission.submissionStatus === "Late" ||
+    submission.status === "Late";
 
   return (
     <div className="submission-card">
@@ -1354,32 +1528,51 @@ function SubmissionCard({ submission }) {
         <small>
           {formatDate(submission.submittedAt)}
         </small>
+
+        <small className={isLate ? "late-text" : "ontime-text"}>
+          {isLate ? "Submitted late" : "Submitted on time"}
+        </small>
       </div>
 
       <span
         className={`mini-status ${
-          graded ? "success" : "waiting"
+          graded
+            ? "success"
+            : isLate
+            ? "late-mini"
+            : "waiting"
         }`}
       >
-        {graded ? `${submission.marks} marks` : "Submitted"}
+        {graded
+          ? `${submission.marks} marks`
+          : isLate
+          ? "Late"
+          : "Submitted"}
       </span>
     </div>
   );
 }
 
 function DeadlineItem({ assignment }) {
+  const deadlinePassed = isDeadlinePassed(assignment.dueDate);
+
   return (
     <div className="deadline-item">
       <div className="deadline-date">
         {getDay(assignment.dueDate)}
+
         <small>{getMonth(assignment.dueDate)}</small>
       </div>
 
       <div>
-        <strong>{assignment.title || "Assignment"}</strong>
+        <strong>
+          {assignment.title || "Assignment"}
+        </strong>
 
         <span>
-          Due {formatDate(assignment.dueDate)}
+          {deadlinePassed
+            ? `Deadline passed • ${formatDate(assignment.dueDate)}`
+            : `Due ${formatDate(assignment.dueDate)}`}
         </span>
       </div>
     </div>
@@ -1395,6 +1588,7 @@ function LoadingScreen() {
         <div className="loading-spinner"></div>
 
         <h2>EduSubmit</h2>
+
         <p>Connecting to your cloud workspace...</p>
       </div>
     </div>
@@ -1402,13 +1596,124 @@ function LoadingScreen() {
 }
 
 /* =========================================================
-   HELPERS
+   DEADLINE HELPERS
+========================================================= */
+
+function getAssignmentStatus(assignment, submission) {
+  if (!submission) {
+    return isDeadlinePassed(assignment.dueDate)
+      ? "Overdue"
+      : "Pending";
+  }
+
+  if (
+    submission.marks !== null &&
+    submission.marks !== undefined &&
+    submission.marks !== ""
+  ) {
+    return "Graded";
+  }
+
+  if (
+    submission.submissionStatus === "Late" ||
+    submission.status === "Late"
+  ) {
+    return "Late";
+  }
+
+  const submittedDate =
+    convertTimestamp(submission.submittedAt) ||
+    convertTimestamp(submission.submittedAtClient);
+
+  const dueDate = convertTimestamp(assignment.dueDate);
+
+  if (submittedDate && dueDate) {
+    return submittedDate.getTime() > dueDate.getTime()
+      ? "Late"
+      : "Submitted";
+  }
+
+  return "Submitted";
+}
+
+function getDeadlineMessage(assignment, submission) {
+  if (submission) {
+    const status = getAssignmentStatus(
+      assignment,
+      submission
+    );
+
+    if (status === "Late") {
+      return "Submitted after the deadline";
+    }
+
+    if (status === "Graded") {
+      return "Submitted and graded";
+    }
+
+    return "Submitted on time";
+  }
+
+  if (isDeadlinePassed(assignment.dueDate)) {
+    return "Deadline has passed — late submission is allowed";
+  }
+
+  return getTimeRemaining(assignment.dueDate);
+}
+
+function isDeadlinePassed(value) {
+  const date = convertTimestamp(value);
+
+  if (!date) return false;
+
+  return new Date().getTime() > date.getTime();
+}
+
+function getTimeRemaining(value) {
+  const date = convertTimestamp(value);
+
+  if (!date) {
+    return "No deadline specified";
+  }
+
+  const difference = date.getTime() - new Date().getTime();
+
+  if (difference <= 0) {
+    return "Deadline passed";
+  }
+
+  const totalMinutes = Math.floor(
+    difference / (1000 * 60)
+  );
+
+  const days = Math.floor(totalMinutes / (60 * 24));
+  const hours = Math.floor(
+    (totalMinutes % (60 * 24)) / 60
+  );
+  const minutes = totalMinutes % 60;
+
+  if (days > 0) {
+    return `${days} day${days === 1 ? "" : "s"} remaining`;
+  }
+
+  if (hours > 0) {
+    return `${hours} hour${hours === 1 ? "" : "s"} remaining`;
+  }
+
+  return `${minutes} minute${
+    minutes === 1 ? "" : "s"
+  } remaining`;
+}
+
+/* =========================================================
+   GENERAL HELPERS
 ========================================================= */
 
 function getGreeting() {
   const hour = new Date().getHours();
 
   if (hour < 12) return "morning";
+
   if (hour < 18) return "afternoon";
 
   return "evening";
@@ -1425,9 +1730,23 @@ function convertTimestamp(value) {
     return value;
   }
 
-  const date = new Date(value);
+  if (typeof value === "string") {
+    const date = new Date(value);
 
-  return Number.isNaN(date.getTime()) ? null : date;
+    return Number.isNaN(date.getTime())
+      ? null
+      : date;
+  }
+
+  if (typeof value === "number") {
+    const date = new Date(value);
+
+    return Number.isNaN(date.getTime())
+      ? null
+      : date;
+  }
+
+  return null;
 }
 
 function formatDate(value) {
