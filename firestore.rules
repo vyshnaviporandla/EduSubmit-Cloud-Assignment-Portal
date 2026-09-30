@@ -3,42 +3,125 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
+    /* =====================================================
+       HELPER FUNCTIONS
+    ===================================================== */
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isTeacher() {
+      return signedIn()
+        && get(
+          /databases/$(database)/documents/profiles/$(request.auth.uid)
+        ).data.role == "teacher";
+    }
+
+    function isStudent() {
+      return signedIn()
+        && get(
+          /databases/$(database)/documents/profiles/$(request.auth.uid)
+        ).data.role == "student";
+    }
+
+    function isOwner(userId) {
+      return signedIn()
+        && request.auth.uid == userId;
+    }
+
+
+    /* =====================================================
+       PROFILES
+    ===================================================== */
+
     match /profiles/{userId} {
-      allow create: if request.auth != null
-                    && request.auth.uid == userId
-                    && request.resource.data.uid == userId
-                    && request.resource.data.role == "student";
 
-      allow read: if request.auth != null
-                   && request.auth.uid == userId;
+      // A user can read their own profile.
+      // Teachers can read student profiles.
+      allow read: if signedIn()
+        && (
+          isOwner(userId)
+          || isTeacher()
+        );
 
-      allow update: if request.auth != null
-                    && request.auth.uid == userId
-                    && request.resource.data.uid == resource.data.uid
-                    && request.resource.data.role == resource.data.role;
+      // A user can create their own profile.
+      allow create: if isOwner(userId);
 
+      // Users cannot change their role after registration.
+      allow update: if isOwner(userId)
+        && request.resource.data.role == resource.data.role;
+
+      // Profile deletion is disabled.
       allow delete: if false;
     }
+
+
+    /* =====================================================
+       COURSES
+    ===================================================== */
 
     match /courses/{courseId} {
-      allow read: if request.auth != null;
-      allow create, update, delete: if false;
+
+      // Authenticated users can view courses.
+      allow read: if signedIn();
+
+      // Teachers can create courses.
+      allow create: if isTeacher();
+
+      // Teachers can update courses.
+      allow update: if isTeacher();
+
+      // Teachers can delete courses.
+      allow delete: if isTeacher();
     }
 
+
+    /* =====================================================
+       ASSIGNMENTS
+    ===================================================== */
+
     match /assignments/{assignmentId} {
-      allow read: if request.auth != null;
-      allow create, update, delete: if false;
+
+      // Students and teachers can view assignments.
+      allow read: if signedIn();
+
+      // Only teachers can create assignments.
+      allow create: if isTeacher()
+        && request.resource.data.createdBy == request.auth.uid;
+
+      // Only teachers can update assignments.
+      allow update: if isTeacher();
+
+      // Only teachers can delete assignments.
+      allow delete: if isTeacher();
     }
+
+
+    /* =====================================================
+       SUBMISSIONS
+    ===================================================== */
+
     match /submissions/{submissionId} {
-      allow read: if request.auth != null;
-      allow create, update: if request.auth != null;
+
+      // Students can read their own submissions.
+      // Teachers can read all submissions.
+      allow read: if signedIn()
+        && (
+          isTeacher()
+          || resource.data.studentId == request.auth.uid
+        );
+
+      // Students can create submissions only for themselves.
+      allow create: if isStudent()
+        && request.resource.data.studentId == request.auth.uid;
+
+      // Students cannot modify submissions after creation.
+      // Teachers can grade/update submissions.
+      allow update: if isTeacher();
+
+      // Submissions cannot be deleted.
       allow delete: if false;
-    }
-    match /submissionVersions/{versionId} {
-       allow read: if request.auth != null;
-       allow create: if request.auth != null
-       && request.resource.data.submissionId != null;
-      allow update, delete: if false;
     }
   }
 }
