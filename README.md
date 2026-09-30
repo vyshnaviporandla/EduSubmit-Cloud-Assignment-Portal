@@ -180,8 +180,8 @@ assignments
       ├── createdBy
       └── createdAt
 ```
-submissions
 
+submissions
 Stores student submission information.
 ```text
 submissions
@@ -200,7 +200,7 @@ submissions
       ├── marks
       ├── feedback
       └── submittedAt
-      ```
+```
 ## Security
 
 Firestore Security Rules provide role-based access control.
